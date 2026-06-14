@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fix-llm-xml"
+version = "1.0"
+authors = [
+  { name="Dingyuan Wang", email="abcdoyle888@gmail.com" },
+]
+description = "Practical, ready-to-use tools for LLM generated XML"
+readme = "README.md"
+requires-python = ">=3.8"
+license = "MIT"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries",
+    "Topic :: Text Processing :: Markup :: XML"
+]
+dependencies = [
+    "lxml",
+    "xmltodict",
+]
+
+[project.optional-dependencies]
+test = [
+    "hypothesis"
+]
+
+[project.urls]
+Homepage = "https://github.com/gumblex/fix-llm-xml"
+Issues = "https://github.com/gumblex/fix-llm-xml/issues"
+
+[tool.setuptools]
+py-modules = ["fix_llm_xml"]
