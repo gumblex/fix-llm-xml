@@ -6,6 +6,8 @@
 
 [中文文档](./README.zh.md)
 
+> Your precious tokens will not be eaten by XML parsers!
+
 `fix-llm-xml` is specifically designed to solve common formatting errors that occur when Large Language Models (LLMs) output XML.  
 It gracefully handles unescaped special characters, mismatched tags, malformed CDATA, missing closing tags and more, while **guaranteeing full integrity of content inside plaintext tags**.
 

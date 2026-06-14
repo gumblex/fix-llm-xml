@@ -4,6 +4,8 @@
 [![PyPI version](https://img.shields.io/pypi/v/fix-llm-xml)](https://pypi.org/project/fix-llm-xml/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
+> 您宝贵的 token 不会再被 XML 解析器偷吃啦！
+
 `fix-llm-xml` 专为解决大语言模型（LLM）输出 XML 时经常出现的各种格式错误而生。  
 它可以优雅地处理未转义的特殊字符、标签不匹配、畸形 CDATA、缺失闭合标签等问题，并**保证纯文本标签内的内容完整**。
 
