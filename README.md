@@ -8,15 +8,16 @@
 
 > Your precious tokens will not be eaten by XML parsers!
 
-`fix-llm-xml` is specifically designed to solve common formatting errors that occur when Large Language Models (LLMs) output XML.  
-It gracefully handles unescaped special characters, mismatched tags, malformed CDATA, missing closing tags and more, while **guaranteeing full integrity of content inside plaintext tags**.
+`fix-llm-xml` is specifically designed to solve common formatting errors that occur when Large Language Models (LLMs) output XML.
+
+It gracefully handles unescaped special characters, mismatched tags, malformed CDATA, missing closing tags and more, while **guaranteeing full integrity of content inside specified plaintext tags**.
 
 Validated by **over 100 random tests** and numerous real-world scenarios, it easily handles all kinds of corrupted XML produced by LLMs.
 
 ## Key Features
 
 - 🧩 **Smart Parsing** – `parse_xml` provides one-click repair + parsing, automatically repair if the first attempt fails.
-- 🛡️ **Text Content Preservation** – Automatically escapes and retains original content for user-specified plaintext tags (and CDATA content), preventing data loss during automatic repair.
+- 📃 **Text Content Preservation** – Automatically escapes and retains original content for user-specified plaintext tags (and CDATA content), preventing data loss during automatic repair.
 - 🔧 **Automatic Tag Structure Repair** – Completes missing closing tags, discards redundant closing tags.
 - 📦 **Deep CDATA Repair** – Handles nested CDATA, malformed CDATA prefixes, incorrect CDATA closing formats, and automatically escapes internal `]]>` to a safe form.
 - 🌍 **Namespace Support** – Supports tags with namespace prefixes (e.g. `ns:code`).
@@ -68,7 +69,7 @@ print(parsed)
 ### `parse_xml(s, root, text_tags=None, **kwargs)`
 
 All-in-one function to extract, repair, and parse XML from messy strings into Python dictionaries (**xmltodict** format).
-Internally it first calls `find_xml_document` and parses with `xmltodict`; if direct parsing fails, it calls `fix_xml_with_text_tags` + lxml repair for a second parsing attempt.
+Internally it first calls `find_xml_document` and parses with `xmltodict`. If there are nested tags in `text_tags` or direct parsing fails, it calls `fix_xml_with_text_tags` + lxml repair for a second parsing attempt.
 
 **Parameters**:
 - `s` (str): Original input string.
@@ -189,7 +190,7 @@ This library assumes your workflow is as follows:
 
 1. You send a prompt to an LLM, requiring it to return structured data in **XML format**.
 2. The text returned by the LLM may contain other natural language text before and after the XML.
-3. You know in advance which tags are "plaintext tags" (e.g. `<file>`, `<answer>`), or instruct the LLM to wrap text content in CDATA. The content of these tags should not be parsed as XML child elements, but as complete plaintext/code snippets.
+3. You specify in advance which tags are "**plaintext tags**" (e.g. `<file>`, `<answer>`), or instruct the LLM to wrap text content in CDATA. The content of these tags should not be parsed as XML child elements, but as complete plaintext/code snippets.
 4. You want to reasonably parse this output **without losing any text content**.
 
 This library provides a complete set of tools for the above process, especially good at handling the following common LLM output errors:

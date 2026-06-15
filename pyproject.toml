@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fix-llm-xml"
-version = "1.0"
+version = "1.1"
 authors = [
   { name="Dingyuan Wang", email="abcdoyle888@gmail.com" },
 ]

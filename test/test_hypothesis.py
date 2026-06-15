@@ -2,11 +2,12 @@
 Property-based (invariant) unit tests for the fix_llm_xml module.
 Uses unittest and hypothesis to validate key invariants of the XML repair functions.
 """
-import html
+import re
 import unittest
+from xml.sax import saxutils
 import xml.etree.ElementTree as ET
 
-from hypothesis import given, strategies as st, assume, settings, reproduce_failure
+from hypothesis import given, strategies as st, assume, settings
 from lxml import etree
 
 import fix_llm_xml
@@ -201,15 +202,139 @@ def xml_with_text_tag(
 
 
 @st.composite
-def balanced_fragment(draw):
-    leaf = st.just("") | st_tag_name.map(lambda n: f"<{n}/>")
-    def kids_of(children):
-        return st.builds(
-            lambda tag, kids: f"<{tag}>" + "".join(kids) + f"</{tag}>",
-            st_tag_name,
-            st.lists(children, max_size=3),
-        )
-    return draw(st.recursive(leaf, kids_of, max_leaves=10))
+def random_xml(draw):
+    """Generate a well-formed XML fragment using lxml.
+    May include nested elements with attributes, text,
+    comments, and processing instructions.
+    Occasionally returns an empty string to represent an empty fragment.
+    """
+    max_depth = draw(st.integers(min_value=0, max_value=5))
+
+    # safe_attr_chars = st.characters(
+    #     codec='utf-8',
+    #     exclude_categories=('Cc',),
+    #     exclude_characters="<>&'\""
+    # )  # 属性值避免直接包含可能破坏引号的字符
+
+    def gen_elem(depth: int):
+        tag = draw(st_tag_name)
+        elem = etree.Element(tag)
+
+        # ----------------- 属性 -----------------
+        num_attrs = draw(st.integers(min_value=0, max_value=2))
+        for _ in range(num_attrs):
+            key = draw(st_tag_name)
+            value = draw(st.text(alphabet=st_char_no_controls, max_size=10))
+            elem.set(key, value)
+
+        # ----------------- 元素文本 -----------------
+        if draw(st.booleans()):
+            text_str = draw(st.text(alphabet=st_char_no_controls, max_size=30))
+            elem.text = text_str
+
+        # ----------------- 子节点 -----------------
+        if depth < max_depth:
+            num_children = draw(st.integers(min_value=0, max_value=3))
+            for _ in range(num_children):
+                kind = draw(st.sampled_from(['element', 'comment', 'pi']))
+                if kind == 'element':
+                    child = gen_elem(depth + 1)
+                else:
+                    comment_text = draw(st.text(alphabet=st_char_no_controls, max_size=20))
+                    # 确保没有连续的“--”，避免 XML 注释格式错误
+                    comment_text = comment_text.replace('--', '- - ').rstrip('-')
+                    child = etree.Comment(comment_text)
+                elem.append(child)
+                # 子节点之后的 tail 文本
+                if draw(st.booleans()):
+                    tail_text = draw(st.text(alphabet=st_char_no_controls, max_size=20))
+                    child.tail = tail_text
+        elif draw(st.booleans()):
+            comment_text = draw(st.text(alphabet=st_char_no_controls, max_size=20))
+            comment_text = comment_text.replace('--', '- - ').rstrip('-')
+            child = etree.Comment(comment_text)
+            elem.append(child)
+
+        return elem
+
+    root = gen_elem(0)
+    xml_str = etree.tostring(root, encoding='unicode', method='xml',
+                             xml_declaration=False)
+    return xml_str
+
+
+@st.composite
+def xml_with_optional_nested_text_tag(draw, text_tags, nested=None, root=None):
+    """
+    Generate a well-formed XML document containing a text tag, optionally with nested child elements.
+    Uses lxml.etree for XML construction to ensure well-formed output.
+    """
+    if not text_tags:
+        raise ValueError("text_tags must not be empty")
+    tname = draw(st.sampled_from(list(text_tags)))
+    if root is None:
+        root_tag = draw(st_tag_name)
+        assume(root_tag != tname)
+    else:
+        root_tag = root
+        assume(root_tag != tname)
+
+    # Build the element tree using lxml.etree
+    root_elem = etree.Element(root_tag)
+    tname_elem = etree.SubElement(root_elem, tname)
+
+    # Optional attributes on the text tag
+    if draw(st.booleans()):
+        attr_value = draw(st_tag_name)
+        tname_elem.set('a', attr_value)
+
+    # Determine if nested content should be included
+    if nested is None:
+        has_nested = draw(st.booleans())
+    else:
+        has_nested = nested
+
+    if has_nested:
+        # Optional leading text
+        if draw(st.booleans()):
+            text = draw(st.text(alphabet=st_char_no_controls, min_size=1, max_size=10))
+            tname_elem.text = text
+        # First child element
+        child_tag = draw(st_tag_name)
+        child_elem = etree.SubElement(tname_elem, child_tag)
+        child_text = draw(st.text(alphabet=st_char_no_controls, min_size=1, max_size=10))
+        child_elem.text = child_text
+        # Optional second child or trailing text
+        if draw(st.booleans()):
+            if draw(st.booleans()):
+                child2_tag = draw(st_tag_name)
+                child2_elem = etree.SubElement(tname_elem, child2_tag)
+                child2_text = draw(st.text(alphabet=st_char_no_controls, min_size=1, max_size=10))
+                child2_elem.text = child2_text
+            else:
+                tail_text = draw(st.text(alphabet=st_char_no_controls, min_size=1, max_size=10))
+                child_elem.tail = tail_text
+    else:
+        text = draw(st.text(alphabet=st_char_no_controls, min_size=1, max_size=30))
+        tname_elem.text = text
+
+    tname_str = etree.tostring(
+        tname_elem, encoding='unicode', method='xml', xml_declaration=False)
+
+    re_tname = re.compile('^<%s[^>]*>(.*)</%s>$' % (re.escape(tname), re.escape(tname)))
+    inner_str = re_tname.match(tname_str).group(1)
+
+    xml_str = etree.tostring(
+        root_elem, encoding='unicode', method='xml', xml_declaration=False)
+
+    return {
+        'xml': xml_str,
+        'root': root_tag,
+        'tname': tname,
+        'has_nested': has_nested,
+        'text_tags': list(text_tags),
+        'inner_str': inner_str,
+    }
 
 
 @st.composite
@@ -257,7 +382,7 @@ def is_parseable_by_lxml(xml_str):
         return True
     except etree.XMLSyntaxError:
         # avoid invalid entity
-        if '&' in fixed_xml:
+        if '&' in xml_str:
             assume(False)
         return False
 
@@ -304,8 +429,8 @@ class TestFixXmlFinalTagsStructure(unittest.TestCase):
         self.assertEqual(fixed1, fixed2,
                          f"Not idempotent:\nFirst: {fixed1}\nSecond: {fixed2}")
 
-    @given(balanced_fragment())
-    def test_balanced_input_unchanged(self, xml_str):
+    @given(random_xml())
+    def test_good_xml_unchanged(self, xml_str):
         """If the input is already tag-balanced (no text), it should not be modified."""
         fixed = fix_llm_xml.fix_xml_with_text_tags(xml_str, text_tags=[])
         self.assertEqual(xml_str, fixed,
@@ -369,12 +494,52 @@ class TestFixXmlFinalTagsTextContent(unittest.TestCase):
             test_extracted = unescape_cdata(extracted)
             test_content = unescape_cdata(content)
         else:
-            test_extracted = html.unescape(extracted)
-            test_content = html.unescape(content)
+            test_extracted = saxutils.unescape(extracted)
+            test_content = saxutils.unescape(content)
 
         self.assertEqual(test_extracted, test_content,
                          f"Content mismatch.\nOriginal XML: {xml!r}\n"
                          f"Extracted: {extracted!r}\nFixed: {fixed!r}")
+
+    @given(xml_with_optional_nested_text_tag(text_tags=["code"]))
+    def test_parse_xml_content_preservation(self, case):
+        """For well‑formed XML with a text tag (nested or not), the full
+        unescaped inner content must survive a parse_xml roundtrip."""
+        result = fix_llm_xml.parse_xml(
+            case["xml"], case["root"],
+            text_tags=case["text_tags"],
+            strip_whitespace=False,
+        )
+        self.assertIsNotNone(result, f"parse_xml returned None for\n{case['xml']}")
+        extracted = fix_llm_xml.get_xml_tag_text(result[case["root"]][case["tname"]])
+        test_extracted = saxutils.unescape(extracted)
+        test_content = saxutils.unescape(case["inner_str"])
+        self.assertEqual(test_extracted, test_content,
+                         f"Content mismatch\nXML: {case['xml']}\n"
+                         f"Extracted: {extracted!r}\nExpected: {case['inner_str']!r}")
+
+    @given(xml_with_optional_nested_text_tag(text_tags=["code"], nested=True))
+    def test_parse_xml_nested_flattened(self, case):
+        """When nested elements exist inside a text tag, the result must NOT
+        contain nested dicts for that tag."""
+        result = fix_llm_xml.parse_xml(
+            case["xml"], case["root"],
+            text_tags=case["text_tags"],
+            strip_whitespace=False,
+        )
+        self.assertIsNotNone(result)
+        tag_value = result[case["root"]][case["tname"]]
+        # After repair, the text tag value should be a string or a dict with
+        # only @attrs / #text, never a nested element key.
+        if isinstance(tag_value, dict):
+            for k in tag_value:
+                self.assertTrue(k.startswith("@") or k == "#text",
+                                f"Unexpected nested key '{k}' in {tag_value}")
+        elif isinstance(tag_value, list):
+            for item in tag_value:
+                if isinstance(item, dict):
+                    for k in item:
+                        self.assertTrue(k.startswith("@") or k == "#text")
 
     # ---- 2. Missing-close ------------------------------------------------
 
@@ -403,8 +568,8 @@ class TestFixXmlFinalTagsTextContent(unittest.TestCase):
                 test_extracted = unescape_cdata(extracted)
                 test_content = unescape_cdata(content)
             else:
-                test_extracted = html.unescape(extracted)
-                test_content = html.unescape(content)
+                test_extracted = saxutils.unescape(extracted)
+                test_content = saxutils.unescape(content)
             self.assertIn(test_content, test_extracted,
                           f"Original content lost.\nOriginal XML: {case['xml']!r}\n"
                           f"Extracted: {extracted!r}\nFixed: {fixed!r}")
@@ -437,8 +602,8 @@ class TestFixXmlFinalTagsTextContent(unittest.TestCase):
             test_extracted = unescape_cdata(extracted)
             test_content = unescape_cdata(content)
         else:
-            test_extracted = html.unescape(extracted)
-            test_content = html.unescape(content)
+            test_extracted = saxutils.unescape(extracted)
+            test_content = saxutils.unescape(content)
 
         self.assertEqual(test_extracted, test_content,
                          f"Content with ']]>' not preserved.\nOriginal: {content!r}\n"
@@ -464,8 +629,8 @@ class TestFixXmlFinalTagsTextContent(unittest.TestCase):
             test_extracted = unescape_cdata(extracted)
             test_content = unescape_cdata(content)
         else:
-            test_extracted = html.unescape(extracted)
-            test_content = html.unescape(content)
+            test_extracted = saxutils.unescape(extracted)
+            test_content = saxutils.unescape(content)
         self.assertEqual(test_extracted, test_content,
                          f"Content mismatch.\nOriginal XML: {xml!r}\n"
                          f"Extracted: {extracted!r}\nFixed: {fixed!r}")
@@ -509,7 +674,8 @@ class TestEscapeCdataEnds(unittest.TestCase):
         """Output must not contain a bare CDATA_END outside of ESCAPED_CDATA_END."""
         escaped = fix_llm_xml._escape_cdata_ends(s)
         temp = escaped.replace(fix_llm_xml.ESCAPED_CDATA_END, '')
-        self.assertNotIn(fix_llm_xml.CDATA_END, temp,
+        self.assertNotIn(
+            fix_llm_xml.CDATA_END, temp,
                          f"Bare CDATA_END found in: {escaped!r}")
 
     @given(text_with_combos(combos=(fix_llm_xml.CDATA_END, fix_llm_xml.ESCAPED_CDATA_END)))

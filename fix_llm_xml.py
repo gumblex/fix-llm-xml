@@ -6,11 +6,12 @@ malformed CDATA sections, missing closing tags, etc. This library handles these 
 while preserving content integrity, designed specifically for LLM output scenarios.
 """
 import re
-from typing import Optional, Dict, List, Iterable, Tuple
+from typing import Optional, Dict, List, Iterable, Tuple, Any, Set
 
 import xmltodict
 from lxml import etree
 
+VERSION = '1.1'
 
 # ------------------------------
 # Constant Definitions
@@ -100,8 +101,9 @@ def parse_xml(
     if not xml_str:
         return None
 
+    text_tags_set = set(text_tags or [])
     try:
-        return xmltodict.parse(
+        parsed = xmltodict.parse(
             xml_str,
             process_namespaces=False,
             disable_entities=True,
@@ -109,11 +111,13 @@ def parse_xml(
         )
     except Exception:
         # Attempt to repair XML before retry
-        xml_str = fix_xml_with_text_tags(xml_str, text_tags or [])
+        xml_str = fix_xml_with_text_tags(xml_str, text_tags_set)
         try:
             # Use lxml's recover mode to fix remaining structural errors
-            root_elem = etree.fromstring(xml_str, parser=etree.XMLParser(recover=True))
-            fixed_xml = etree.tostring(root_elem, encoding="utf-8").decode("utf-8")
+            root_elem = etree.fromstring(xml_str, parser=etree.XMLParser(
+                recover=True, resolve_entities=False, no_network=True
+            ))
+            fixed_xml = etree.tostring(root_elem, encoding="unicode")
             return xmltodict.parse(
                 fixed_xml,
                 process_namespaces=False,
@@ -122,6 +126,23 @@ def parse_xml(
             )
         except Exception:
             return None
+
+    # Direct parsing succeeded; check if any text_tag still contains nested child elements
+    if text_tags and _parsed_dict_has_nested_text_tags(parsed, text_tags_set):
+        # Valid XML but text_tags have nested content
+        try:
+            fixed_xml = fix_xml_with_text_tags(xml_str, text_tags_set)
+            return xmltodict.parse(
+                fixed_xml,
+                process_namespaces=False,
+                disable_entities=True,
+                **kwargs
+            )
+        except Exception:
+            # Fallback: return original parsed result if flattening fails
+            return parsed
+
+    return parsed
 
 
 def fix_xml_with_text_tags(xml: str, text_tags: Iterable[str] = ()) -> str:
@@ -299,6 +320,42 @@ def _escape_xml_entity(s: str) -> str:
     return ''.join(parts)
 
 
+def _parsed_dict_has_nested_text_tags(parsed: Dict[str, Any], text_tags_set: Set[str]) -> bool:
+    """
+    Recursively check if any tag in text_tags_set contains unexpected nested elements
+    in the parsed dictionary (i.e. the xmltodict result has child keys other than
+    attributes and #text for that tag).
+    """
+    def _value_has_children(value) -> bool:
+        """Check if a parsed value represents an element with child elements (not just text)."""
+        if isinstance(value, dict):
+            for k in value:
+                if not k.startswith('@') and k != '#text':
+                    return True
+        elif isinstance(value, list):
+            for item in value:
+                if _value_has_children(item):
+                    return True
+        return False
+
+    def _check(obj) -> bool:
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                if key in text_tags_set:
+                    if _value_has_children(value):
+                        return True
+                else:
+                    if _check(value):
+                        return True
+        elif isinstance(obj, list):
+            for item in obj:
+                if _check(item):
+                    return True
+        return False
+
+    return _check(parsed)
+
+
 def _parse_xml_tag(xml: str, pos: int) -> Optional[Tuple[str, Optional[str], str, int, int]]:
     """
     Try to parse an XML tag (comment, opening, closing, self-closing) from given position.
@@ -403,6 +460,8 @@ def _process_text_tag(
 
     # Regex for malformed CDATA closing patterns
     compat_re = re.compile(r'(</CDATA>|\]+>+)</' + re.escape(tname) + '>') if outer_is_cdata else None
+    close_tag = f'</{tname}>'
+    close_combo = f']]></{tname}>'
 
     while i < xml_len:
         # Fast jump to only possible structural boundary characters
@@ -428,23 +487,25 @@ def _process_text_tag(
 
             # Priority 2: Valid CDATA closing + tag closing
             if top_is_cdata and top_typ in ('outer', 'inner'):
-                combo = f']]></{tname}>'
-                if xml.startswith(combo, i):
+                if xml.startswith(close_combo, i):
                     if top_typ == 'outer':
                         content_end = i
-                        outer_close_end = i + len(combo)
+                        outer_close_end = i + len(close_combo)
                         break
                     else:
                         stack.pop()
-                        i += len(combo)
+                        i += len(close_combo)
                         continue
 
             # Priority 3: Malformed CDATA closing pattern + tag closing (LLM common error)
             if top_typ == 'outer' and top_is_cdata and compat_re is not None:
                 m = compat_re.match(xml, i)
                 if m:
-                    content_end = i
-                    outer_close_end = i + m.end()
+                    if m.group().endswith(close_combo):
+                        content_end = m.end() - len(close_combo)
+                    else:
+                        content_end = m.start()
+                    outer_close_end = m.end()
                     break
 
             # Priority 5: Normal CDATA section closing
@@ -462,13 +523,15 @@ def _process_text_tag(
             if top_typ == 'outer' and top_is_cdata and compat_re is not None:
                 m = compat_re.match(xml, i)
                 if m:
-                    content_end = i
-                    outer_close_end = i + m.end()
+                    if m.group().endswith(close_combo):
+                        content_end = m.end() - len(close_combo)
+                    else:
+                        content_end = m.start()
+                    outer_close_end = m.end()
                     break
 
             # Priority 4: Normal closing tag for current text tag
             if top_typ == 'outer' or (top_typ == 'inner' and not top_is_cdata):
-                close_tag = f'</{tname}>'
                 if xml.startswith(close_tag, i):
                     if top_typ == 'outer':
                         content_end = i
@@ -518,11 +581,10 @@ def _process_text_tag(
         best_end = xml_len
         if outer_is_cdata:
             # First try to find valid CDATA + closing tag combo
-            combo = f']]></{tname}>'
-            pos = xml.rfind(combo, search_start, xml_len)
+            pos = xml.rfind(close_combo, search_start, xml_len)
             if pos != -1:
                 best_pos = pos
-                best_end = pos + len(combo)
+                best_end = pos + len(close_combo)
             else:
                 # Try malformed closing patterns
                 if compat_re:
@@ -534,7 +596,6 @@ def _process_text_tag(
                         best_end = last_match.end()
         # Finally try normal closing tag for all cases
         if best_pos == -1:
-            close_tag = f'</{tname}>'
             pos = xml.rfind(close_tag, search_start, xml_len)
             if pos != -1:
                 best_pos = pos
