@@ -16,12 +16,13 @@ Validated by **over 100 random tests** and numerous real-world scenarios, it eas
 
 ## Key Features
 
-- 🧩 **Smart Parsing** – `parse_xml` provides one-click repair + parsing, automatically repair if the first attempt fails.
-- 📃 **Text Content Preservation** – Automatically escapes and retains original content for user-specified plaintext tags (and CDATA content), preventing data loss during automatic repair.
-- 🔧 **Automatic Tag Structure Repair** – Completes missing closing tags, discards redundant closing tags.
-- 📦 **Deep CDATA Repair** – Handles nested CDATA, malformed CDATA prefixes, incorrect CDATA closing formats, and automatically escapes internal `]]>` to a safe form.
+- 🧩 **Smart Parsing** – `parse_xml` provides one-click repair + parsing, automatically runs repair if the initial parse attempt fails.
+- 📃 **Text Content Preservation** – Automatically escapes and retains original text content for user-specified plaintext tags (and CDATA content), preventing content from being misparsed as XML structures.
+- 🔧 **Automatic Tag Structure Repair** – Completes missing closing tags, discards redundant closing tags; when mismatched closing tags are encountered, it prioritizes closing the current layer to preserve as much subsequent content as possible.
+- 📦 **CDATA Compatibility Processing** – Recognizes both standard and common malformed CDATA syntax, standardizes CDATA section output, and safely handles internal `]]>` sequences.
+- 🧷 **Automatic Attribute Repair** – Completes unclosed quotes, adds quotes to unquoted attribute values, escapes special characters in attribute values, and removes duplicate attributes.
 - 🌍 **Namespace Support** – Supports tags with namespace prefixes (e.g. `ns:code`).
-- 🧪 **Comprehensively Tested** – Combines traditional unit testing with Hypothesis property-based random testing to verify correctness under all kinds of extreme conditions.
+- 🧪 **Comprehensively Tested** – Combines traditional unit testing with property-based random testing to cover a wide range of extreme and corrupted input scenarios.
 - 📁 **Minimal Dependencies** – Only depends on `lxml` and `xmltodict`, suitable for production environments.
 
 ## Installation
@@ -59,22 +60,24 @@ Some irrelevant prefix text
 </result>
 '''
 
-parsed = parse_xml(llm_output, root="result")
+parsed = parse_xml(llm_output, root="result", text_tags=["answer"])
 print(parsed)
-# {'result': {'answer': 'if a < b && c > d', 'file': {'@name': 'a.html', '#text': '<!DOCTYPE html><html lang="en">...</html>'}}}
+# {'result': {'answer': 'if a < b && c > d', 'file': {'@name': 'a.html', '#text': '<!DOCTYPE html><html lang="en">...</html>'}, 'meta': {'confidence': '0.95'}}}
 ```
+
+In this example, the `answer` tag is treated as a plaintext tag and its content is properly escaped. The `file` tag retains its content as CDATA even though it is not included in the `text_tags` list, as it is immediately followed by a CDATA opening prefix.
 
 ## API Reference
 
 ### `parse_xml(s, root, text_tags=None, **kwargs)`
 
 All-in-one function to extract, repair, and parse XML from messy strings into Python dictionaries (**xmltodict** format).
-Internally it first calls `find_xml_document` and parses with `xmltodict`. If there are nested tags in `text_tags` or direct parsing fails, it calls `fix_xml_with_text_tags` + lxml repair for a second parsing attempt.
+Internally, it first calls `find_xml_document` and attempts direct parsing. If abnormal nesting is detected in `text_tags` or direct parsing fails, it invokes `fix_xml_with_text_tags` to repair the content before re-parsing.
 
 **Parameters**:
 - `s` (str): Original input string.
 - `root` (str): Expected root tag name.
-- `text_tags` (Optional[List[str]]): List of known plaintext tags, passed to `fix_xml_with_text_tags`.
+- `text_tags` (Optional[List[str]]): List of known tags that **contain only plaintext content**, passed to `fix_xml_with_text_tags`.
 - `**kwargs`: Additional parameters passed to `xmltodict.parse`, common options include:
   - `force_list` (List[str]): Force specified tags to always be parsed as lists (even if only one instance exists).
   - `strip_whitespace` (bool): Default `True`, whether to strip leading/trailing whitespace from text values.
@@ -161,20 +164,19 @@ For example, if downstream users do not want to use xmltodict, they can directly
 
 **Parameters**:
 - `xml` (str): XML string to be repaired.
-- `text_tags` (Iterable[str]): Iterable of plaintext tag names (case-sensitive, supports `ns:tag` format). These tags are considered to contain only plain text, no internal child elements will be parsed; characters such as `<`, `>`, `&` inside will be properly escaped, or protected via CDATA.
+- `text_tags` (Iterable[str]): Iterable of plaintext tag names (case-sensitive, supports `ns:tag` format). These tags are considered to contain **only plain text content**, no internal child elements will be parsed; unescaped special characters in the content will be properly handled.
 
 **Return Value**:
 - `str`: Valid XML string after repair.
 
 **Core Behaviors**:
-- Automatically closes unclosed regular tags, deletes redundant closing tags.
-- Automatically escapes text, will not re-escape already escaped content.
-- For plaintext tags (listed in text_tags, or wrapped with CDATA):
-  - Automatically detects CDATA usage (including malformed CDATA prefixes/suffixes) and standardizes it.
-  - In CDATA mode, escapes nested `]]>` to `]]]]><![CDATA[>`; will not re-escape already escaped content.
-  - In normal mode, escapes `<`, `>`, `&` to corresponding XML entities; will not re-escape already escaped entities.
-- Retains all attributes, comments, self-closing tags.
-- Does not guarantee 100% compliance with XML specifications, does not support advanced XML features; output may still have logical issues, requires re-parsing by a lenient XML parser.
+- Automatically closes unclosed regular tags, discards redundant or mismatched closing tags; when mismatched closing tags are encountered, it prioritizes closing the current layer to avoid swallowing subsequent content.
+- Repairs start tag attributes: completes unclosed quotes, adds double quotes to unquoted attribute values, cleans illegal attribute names, escapes special characters in attribute values, keeps the first occurrence of duplicate attributes, and strips all attributes from end tags.
+- For plaintext tags listed in `text_tags` (that are not immediately followed by a CDATA opening prefix): content is escaped as standard XML text; any malformed CDATA syntax inside is treated as regular text, and will not switch to CDATA parsing mode.
+- For any tag that is immediately followed by a standard or malformed CDATA opening prefix: its content is processed as CDATA regardless of whether it is listed in `text_tags`. Output is standardized as proper CDATA sections, internal `]]>` sequences are safely escaped, and valid or suspected CDATA end markers are properly cleaned.
+- Valid native CDATA sections inside regular structural tags are preserved unchanged.
+- Valid same-name nested tag structures are kept as-is; for same-name structures caused by missing closing tags, they are adjusted to parallel nodes as much as possible to avoid content loss.
+- The output is syntactically well-formed XML, does not support advanced XML features, and can be passed to a lenient parser for further processing.
 
 **Example**:
 ```python
@@ -190,25 +192,27 @@ This library assumes your workflow is as follows:
 
 1. You send a prompt to an LLM, requiring it to return structured data in **XML format**.
 2. The text returned by the LLM may contain other natural language text before and after the XML.
-3. You specify in advance which tags are "**plaintext tags**" (e.g. `<file>`, `<answer>`), or instruct the LLM to wrap text content in CDATA. The content of these tags should not be parsed as XML child elements, but as complete plaintext/code snippets.
+3. You specify in advance which tags are "**plaintext tags**" (e.g. `<file>`, `<answer>`), or instruct the LLM to wrap text content in CDATA.
 4. You want to reasonably parse this output **without losing any text content**.
 
-This library provides a complete set of tools for the above process, especially good at handling the following common LLM output errors:
+Guidelines for handling plaintext content:
+- Tags containing plaintext content should be declared in the `text_tags` list.
+- Long text content is best requested to be wrapped by LLMs in CDATA tags.
+- Plaintext tags without CDATA wrapping should not contain unescaped XML tags in their content.
+
+This library is especially good at handling the following common LLM output errors:
 
 - Unescaped special characters: `1 < 2` appears in regular text tags.
 - Incorrectly written CDATA: `<CDATA[`, `[CDATA[`, `]>` etc.
 - Nested XML content is incorrectly wrapped into the same tag.
 - Missing closing tags, or extra redundant closing tags.
+- Unclosed quotes in start tag attributes, unquoted attribute values, illegal attribute names, duplicate attributes, or attributes attached to end tags.
 
 
 ## Testing and Quality Assurance
 
 `fix-llm-xml` has passed a large number of multi-level tests to ensure correct operation under various extreme and random conditions.
 
-- **Conventional Unit Tests**: Covers basic functions, edge cases, examples in documentation, and nearly a hundred deliberately constructed malformed XML samples.
-- **Property-based Random Testing**: Uses [Hypothesis](https://hypothesis.readthedocs.io/) to generate a large number of random, unbalanced XML fragments to verify the following invariants:
-  - All tags in the repaired XML are properly closed.
-  - The result remains unchanged after re-repairing already repaired XML.
-  - Original content inside plaintext tags can be fully recovered after repair.
-  - The escape function will not introduce unescaped special characters, nor will it perform secondary escaping.
-- **Complex Nested Scenarios**: Specifically tested for easily confusing cases such as multi-level nested CDATA, nested tags with the same name, CDATA containing character sequences identical to closing tags, etc.
+- **Conventional Unit Tests**: Covers basic functionality, edge cases, documentation examples, and a large set of deliberately constructed malformed XML samples.
+- **Property-based Random Testing**: Uses [Hypothesis](https://hypothesis.readthedocs.io/) to generate a large number of random, unbalanced XML fragments to verify key invariants such as proper tag closure, repair stability, and recoverability of plaintext tag content.
+- **Complex Nested Scenarios**: Specifically tests easily confusing edge cases including multi-level nested CDATA, same-name nested tags, and CDATA sections containing character sequences identical to closing tags.

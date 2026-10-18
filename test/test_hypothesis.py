@@ -20,6 +20,7 @@ import fix_llm_xml
 # namespace-prefix handling is orthogonal to the invariants tested here.
 st_tag_name = st.from_regex(r'[a-zA-Z_][a-zA-Z0-9_.-]*', fullmatch=True)
 st_char_no_controls = st.characters(codec='utf-8', exclude_categories=('Cc',))
+st_unquoted_attr_value = st.from_regex(r'[A-Za-z0-9_.:-]*', fullmatch=True)
 
 
 @st.composite
@@ -85,6 +86,7 @@ def xml_with_text_tag(
     content_include=(),
     content_exclude=(),
     exclude_tname_tags=False,
+    exclude_root_tags=False,
     exclude_cdata_close_tname=False,
     max_content_size=200,
 ):
@@ -108,6 +110,7 @@ def xml_with_text_tag(
         content_exclude:      substrings that must NOT appear in the content
                               (enforced via assume)
         exclude_tname_tags:   if True, content will never contain </tname> or <tname
+        exclude_root_tags:    if True, content will never contain </root> or <root
         exclude_cdata_close_tname: if True, content will never contain ]]></tname>
         max_content_size:     max length of the generated content text
     Returns a dict with keys:
@@ -159,6 +162,9 @@ def xml_with_text_tag(
     if exclude_tname_tags:
         assume(f"</{tname}>" not in content)
         assume(f"<{tname}" not in content)
+    if exclude_root_tags:
+        assume(f"<{root}" not in content)
+        assume(f"</{root}>" not in content)
     if exclude_cdata_close_tname:
         assume(f"]]></{tname}>" not in content)
 
@@ -202,6 +208,109 @@ def xml_with_text_tag(
 
 
 @st.composite
+def xml_with_cdata_tag(draw, close_style='combo', root=None, tname=None, content=None):
+    """Generate an XML fragment where the text tag starts with a CDATA prefix
+    and uses a specific closing style."""
+    if root is None:
+        root = draw(st_tag_name)
+    if tname is None:
+        tname = draw(st_tag_name)
+    assume(root != tname)
+    if content is None:
+        content = draw(st.text(alphabet=st_char_no_controls, max_size=100))
+    assume(']]>' not in content)
+    assume(f'</{tname}>' not in content)
+    assume(f'<{tname}' not in content)
+    assume(f'<{root}' not in content)
+    assume(f'</{root}>' not in content)
+
+    if close_style == 'combo':
+        inner = f"<![CDATA[{content}]]>"
+        close = f"</{tname}>"
+    elif close_style == 'residue':
+        inner = f"<![CDATA[{content}]>"
+        close = f"</{tname}>"
+    elif close_style == 'residue_space':
+        inner = f"<![CDATA[{content}]]> "
+        close = f"</{tname}>"
+    elif close_style == 'cdata_close':
+        inner = f"<![CDATA[{content}</CDATA>"
+        close = f"</{tname}>"
+    elif close_style == 'plain':
+        inner = f"<![CDATA[{content}"
+        close = f"</{tname}>"
+    else:
+        raise ValueError(close_style)
+
+    xml = f"<{root}><{tname}>{inner}{close}</{root}>"
+    return {'xml': xml, 'root': root, 'tname': tname, 'content': content}
+
+
+@st.composite
+def xml_with_broken_attrs(draw):
+    """Generate an XML fragment with malformed attributes."""
+    root = draw(st_tag_name)
+    tname = draw(st_tag_name)
+    assume(root != tname)
+
+    num_attrs = draw(st.integers(min_value=0, max_value=3))
+    attr_strs = []
+    expected_attrs = {}
+
+    for i in range(num_attrs):
+        kind = draw(st.sampled_from([
+            'normal', 'unclosed_quote', 'quoted_name', 'unquoted_value',
+            'special_chars', 'duplicate'
+        ]))
+        attr_name = draw(st_tag_name)
+        attr_value = draw(st.text(alphabet=st_char_no_controls, max_size=10))
+        assume(not any(c in attr_value for c in '<>&"'))
+
+        if kind == 'normal':
+            attr_strs.append(f'{attr_name}="{attr_value}"')
+            if attr_name not in expected_attrs:
+                expected_attrs[attr_name] = attr_value
+        elif kind == 'unclosed_quote':
+            # Must be the last attribute
+            num_attrs = i + 1
+            attr_strs.append(f'{attr_name}="{attr_value}')
+            if attr_name not in expected_attrs:
+                expected_attrs[attr_name] = attr_value
+            break
+        elif kind == 'quoted_name':
+            attr_strs.append(f'"{attr_name}"="{attr_value}"')
+            if attr_name not in expected_attrs:
+                expected_attrs[attr_name] = attr_value
+        elif kind == 'unquoted_value':
+            unquoted_value = draw(st_unquoted_attr_value)
+            attr_strs.append(f'{attr_name}={unquoted_value}')
+            if attr_name not in expected_attrs:
+                expected_attrs[attr_name] = unquoted_value
+        elif kind == 'special_chars':
+            special = draw(st.sampled_from(['<', '>', '&']))
+            val = attr_value + special
+            attr_strs.append(f'{attr_name}="{val}"')
+            if attr_name not in expected_attrs:
+                expected_attrs[attr_name] = val
+        elif kind == 'duplicate':
+            val1 = attr_value
+            val2 = draw(st.text(alphabet=st_char_no_controls, max_size=10))
+            assume(val1 != val2)
+            assume(not any(c in val1 + val2 for c in '<>&"'))
+            attr_strs.append(f'{attr_name}="{val1}"')
+            attr_strs.append(f'{attr_name}="{val2}"')
+            if attr_name not in expected_attrs:
+                expected_attrs[attr_name] = val1  # first wins
+
+    attr_str = ' '.join(attr_strs)
+    if attr_str:
+        attr_str = ' ' + attr_str
+
+    xml = f'<{root}><{tname}{attr_str}>text</{tname}></{root}>'
+    return {'xml': xml, 'root': root, 'tname': tname, 'expected_attrs': expected_attrs}
+
+
+@st.composite
 def random_xml(draw):
     """Generate a well-formed XML fragment using lxml.
     May include nested elements with attributes, text,
@@ -209,12 +318,6 @@ def random_xml(draw):
     Occasionally returns an empty string to represent an empty fragment.
     """
     max_depth = draw(st.integers(min_value=0, max_value=5))
-
-    # safe_attr_chars = st.characters(
-    #     codec='utf-8',
-    #     exclude_categories=('Cc',),
-    #     exclude_characters="<>&'\""
-    # )  # 属性值避免直接包含可能破坏引号的字符
 
     def gen_elem(depth: int):
         tag = draw(st_tag_name)
@@ -298,24 +401,38 @@ def xml_with_optional_nested_text_tag(draw, text_tags, nested=None, root=None):
         # Optional leading text
         if draw(st.booleans()):
             text = draw(st.text(alphabet=st_char_no_controls, min_size=1, max_size=10))
+            assume(f'<{tname}' not in text and f'</{tname}>' not in text
+                   and f'<{root_tag}' not in text and f'</{root_tag}>' not in text)
             tname_elem.text = text
         # First child element
         child_tag = draw(st_tag_name)
+        assume(child_tag != tname)
+        assume(child_tag != root_tag)
         child_elem = etree.SubElement(tname_elem, child_tag)
         child_text = draw(st.text(alphabet=st_char_no_controls, min_size=1, max_size=10))
+        assume(f'<{tname}' not in child_text and f'</{tname}>' not in child_text
+               and f'<{root_tag}' not in child_text and f'</{root_tag}>' not in child_text)
         child_elem.text = child_text
         # Optional second child or trailing text
         if draw(st.booleans()):
             if draw(st.booleans()):
                 child2_tag = draw(st_tag_name)
+                assume(child2_tag != tname)
+                assume(child2_tag != root_tag)
                 child2_elem = etree.SubElement(tname_elem, child2_tag)
                 child2_text = draw(st.text(alphabet=st_char_no_controls, min_size=1, max_size=10))
+                assume(f'<{tname}' not in child2_text and f'</{tname}>' not in child2_text
+                       and f'<{root_tag}' not in child2_text and f'</{root_tag}>' not in child2_text)
                 child2_elem.text = child2_text
             else:
                 tail_text = draw(st.text(alphabet=st_char_no_controls, min_size=1, max_size=10))
+                assume(f'<{tname}' not in tail_text and f'</{tname}>' not in tail_text
+                       and f'<{root_tag}' not in tail_text and f'</{root_tag}>' not in tail_text)
                 child_elem.tail = tail_text
     else:
         text = draw(st.text(alphabet=st_char_no_controls, min_size=1, max_size=30))
+        assume(f'<{tname}' not in text and f'</{tname}>' not in text
+               and f'<{root_tag}' not in text and f'</{root_tag}>' not in text)
         tname_elem.text = text
 
     tname_str = etree.tostring(
@@ -364,6 +481,28 @@ _WRAP_TAG = '__w__'
 def unescape_cdata(text: str) -> str:
     """Revert fix_llm_xml.ESCAPED_CDATA_END back to fix_llm_xml.CDATA_END."""
     return text.replace(fix_llm_xml.ESCAPED_CDATA_END, fix_llm_xml.CDATA_END)
+
+
+_XML_PREDEFINED_ENTITIES = {'lt': '<', 'gt': '>', 'amp': '&', 'quot': '"', 'apos': "'"}
+
+
+def xml_unescape(text: str) -> str:
+    """Decode XML entities exactly like an XML parser would: the five
+    predefined named entities plus numeric character references. Unknown
+    named entities are left untouched (fix_llm_xml escapes their '&', so a
+    parser hands them back verbatim). Never apply this to text that was
+    already decoded by lxml — that would decode twice."""
+    def _repl(match):
+        body = match.group(1)
+        if body[0] == '#':
+            try:
+                if body[1] in 'xX':
+                    return chr(int(body[2:], 16))
+                return chr(int(body[1:]))
+            except (ValueError, OverflowError):
+                return match.group(0)
+        return _XML_PREDEFINED_ENTITIES.get(body, match.group(0))
+    return re.sub(r'&(#[0-9]+|#[xX][0-9a-fA-F]+|[a-zA-Z][a-zA-Z0-9]*);', _repl, text)
 
 
 def is_parseable_by_lxml(xml_str):
@@ -421,8 +560,8 @@ class TestFixXmlFinalTagsStructure(unittest.TestCase):
         self.assertTrue(is_parseable_by_lxml(fixed),
                         f"lxml cannot parse: {fixed!r}")
 
-    @given(unbalanced_tag_events())
-    def test_idempotent(self, xml_str):
+    @given(random_xml())
+    def test_idempotent_random(self, xml_str):
         """Applying repair twice must give the same result."""
         fixed1 = fix_llm_xml.fix_xml_with_text_tags(xml_str, text_tags=[])
         fixed2 = fix_llm_xml.fix_xml_with_text_tags(fixed1, text_tags=[])
@@ -475,6 +614,7 @@ class TestFixXmlFinalTagsTextContent(unittest.TestCase):
         missing_close=False,
         extra_close=False,
         exclude_tname_tags=True,
+        exclude_root_tags=True,
         exclude_cdata_close_tname=True,
     ))
     @settings(max_examples=500)
@@ -494,8 +634,8 @@ class TestFixXmlFinalTagsTextContent(unittest.TestCase):
             test_extracted = unescape_cdata(extracted)
             test_content = unescape_cdata(content)
         else:
-            test_extracted = saxutils.unescape(extracted)
-            test_content = saxutils.unescape(content)
+            test_extracted = extracted
+            test_content = xml_unescape(content)
 
         self.assertEqual(test_extracted, test_content,
                          f"Content mismatch.\nOriginal XML: {xml!r}\n"
@@ -512,11 +652,15 @@ class TestFixXmlFinalTagsTextContent(unittest.TestCase):
         )
         self.assertIsNotNone(result, f"parse_xml returned None for\n{case['xml']}")
         extracted = fix_llm_xml.get_xml_tag_text(result[case["root"]][case["tname"]])
-        test_extracted = saxutils.unescape(extracted)
+        # extracted 已经过 xmltodict 的一次解码；inner_str 是 XML 源串，
+        # 只需对 inner_str 做一次 unescape 即可。
+        test_extracted = extracted
         test_content = saxutils.unescape(case["inner_str"])
-        self.assertEqual(test_extracted, test_content,
-                         f"Content mismatch\nXML: {case['xml']}\n"
-                         f"Extracted: {extracted!r}\nExpected: {case['inner_str']!r}")
+        self.assertEqual(
+            test_extracted, test_content,
+            f"Content mismatch\nXML: {case['xml']}\n"
+            f"Extracted: {extracted!r}\nExpected: {case['inner_str']!r}"
+            )
 
     @given(xml_with_optional_nested_text_tag(text_tags=["code"], nested=True))
     def test_parse_xml_nested_flattened(self, case):
@@ -547,11 +691,12 @@ class TestFixXmlFinalTagsTextContent(unittest.TestCase):
         include_cdata_combos=True,
         include_xml_specials=True,
         missing_close=True,
+        exclude_root_tags=True,
     ))
     def test_content_not_lost_missing_close(self, case):
         """When the text tag is missing its close tag, the structure must still
-        be valid, and the original content must appear as a substring of the
-        extracted text (extra text may appear due to closing-tag ambiguity)."""
+        be valid, and the original content must be a prefix of the extracted text
+        (extra text may appear due to closing-tag ambiguity)."""
         tname = case['tname']
         content = case['content']
 
@@ -568,11 +713,12 @@ class TestFixXmlFinalTagsTextContent(unittest.TestCase):
                 test_extracted = unescape_cdata(extracted)
                 test_content = unescape_cdata(content)
             else:
-                test_extracted = saxutils.unescape(extracted)
-                test_content = saxutils.unescape(content)
-            self.assertIn(test_content, test_extracted,
-                          f"Original content lost.\nOriginal XML: {case['xml']!r}\n"
-                          f"Extracted: {extracted!r}\nFixed: {fixed!r}")
+                test_extracted = extracted
+                test_content = xml_unescape(content)
+            self.assertTrue(test_content.startswith(test_extracted),
+                            f"Extracted text is not a prefix of original content.\n"
+                            f"Original: {content!r}\nExtracted: {extracted!r}\n"
+                            f"Fixed: {fixed!r}")
 
     # ---- 3. ]]> as plain text in normal mode -----------------------------
 
@@ -584,6 +730,7 @@ class TestFixXmlFinalTagsTextContent(unittest.TestCase):
         content_include=(fix_llm_xml.CDATA_END,),
         content_exclude=(fix_llm_xml.CDATA_START,),
         exclude_tname_tags=True,
+        exclude_root_tags=True,
     ))
     @settings(max_examples=200)
     def test_cdata_end_as_text_in_normal_mode(self, case):
@@ -602,14 +749,14 @@ class TestFixXmlFinalTagsTextContent(unittest.TestCase):
             test_extracted = unescape_cdata(extracted)
             test_content = unescape_cdata(content)
         else:
-            test_extracted = saxutils.unescape(extracted)
-            test_content = saxutils.unescape(content)
+            test_extracted = extracted
+            test_content = xml_unescape(content)
 
         self.assertEqual(test_extracted, test_content,
                          f"Content with ']]>' not preserved.\nOriginal: {content!r}\n"
                          f"Extracted: {extracted!r}\nFixed: {fixed!r}")
 
-    @given(xml_with_text_tag(missing_close=False))
+    @given(xml_with_text_tag(missing_close=False, exclude_root_tags=True))
     def test_text_tag_content_preserved(self, case):
         """
         Whatever damage is present (except missing close), the raw content inside
@@ -629,13 +776,17 @@ class TestFixXmlFinalTagsTextContent(unittest.TestCase):
             test_extracted = unescape_cdata(extracted)
             test_content = unescape_cdata(content)
         else:
-            test_extracted = saxutils.unescape(extracted)
-            test_content = saxutils.unescape(content)
+            test_extracted = extracted
+            test_content = xml_unescape(content)
         self.assertEqual(test_extracted, test_content,
                          f"Content mismatch.\nOriginal XML: {xml!r}\n"
                          f"Extracted: {extracted!r}\nFixed: {fixed!r}")
 
-    @given(xml_with_text_tag(missing_close=True, missing_root_close=True))
+    @given(xml_with_text_tag(
+        missing_close=True,
+        missing_root_close=True,
+        exclude_root_tags=True,
+    ))
     @settings(max_examples=100)
     def test_text_tag_missing_close_structure(self, case):
         """When text tag and root tag are both missing their close tags, the
@@ -650,9 +801,16 @@ class TestFixXmlFinalTagsTextContent(unittest.TestCase):
         if extracted is None:
             self.fail("Failed to extract text from repaired XML")
         if content:
-            self.assertIn(content, extracted,
-                          f"Original content lost.\nOriginal: {content!r}\n"
-                          f"Extracted: {extracted!r}\nFixed: {fixed!r}")
+            if case['use_cdata']:
+                test_extracted = unescape_cdata(extracted)
+                test_content = unescape_cdata(content)
+            else:
+                test_extracted = extracted
+                test_content = xml_unescape(content)
+            self.assertTrue(test_content.startswith(test_extracted),
+                            f"Extracted text is not a prefix of original content.\n"
+                            f"Original: {content!r}\nExtracted: {extracted!r}\n"
+                            f"Fixed: {fixed!r}")
 
     @given(xml_with_text_tag())
     @settings(max_examples=100)
@@ -663,6 +821,236 @@ class TestFixXmlFinalTagsTextContent(unittest.TestCase):
         fixed2 = fix_llm_xml.fix_xml_with_text_tags(fixed1, text_tags=[tname])
         self.assertEqual(fixed1, fixed2,
                          f"Not idempotent:\nFirst: {fixed1}\nSecond: {fixed2}")
+
+
+class TestCdataStartTag(unittest.TestCase):
+    """Invariants for CDATA start tag handling (design §7)."""
+
+    @given(xml_with_text_tag(use_cdata=True, missing_close=False, extra_close=False))
+    def test_cdata_start_tag_content_preserved(self, case):
+        """Content is preserved even if the tag name is not in text_tags."""
+        fixed = fix_llm_xml.fix_xml_with_text_tags(case['xml'], text_tags=[])
+        extracted = parse_and_extract_text(fixed, case['tname'])
+        self.assertIsNotNone(extracted)
+        test_extracted = unescape_cdata(extracted)
+        test_content = unescape_cdata(case['content'])
+        self.assertEqual(test_extracted, test_content)
+
+    @given(xml_with_cdata_tag(close_style='combo'))
+    def test_cdata_combo_close(self, case):
+        """Standard `]]></name>` combo close works."""
+        fixed = fix_llm_xml.fix_xml_with_text_tags(case['xml'], text_tags=[])
+        extracted = parse_and_extract_text(fixed, case['tname'])
+        self.assertEqual(unescape_cdata(extracted), unescape_cdata(case['content']))
+
+    @given(xml_with_cdata_tag(close_style='residue'))
+    def test_cdata_residue_close(self, case):
+        """`]>` residue before close tag is stripped."""
+        fixed = fix_llm_xml.fix_xml_with_text_tags(case['xml'], text_tags=[])
+        extracted = parse_and_extract_text(fixed, case['tname'])
+        expected = case['content']
+        # content 以 ']' 结尾时，content + ']>' 会形成标准 ']]>'，
+        # 此时 XML 表达的实际内容比生成器记录的 content 少一个 ']'。
+        if expected.endswith(']'):
+            expected = expected[:-1]
+        self.assertEqual(unescape_cdata(extracted), unescape_cdata(expected))
+
+    @given(xml_with_cdata_tag(close_style='residue_space'))
+    def test_cdata_residue_space_close(self, case):
+        """`]]> ` residue before close tag is stripped."""
+        fixed = fix_llm_xml.fix_xml_with_text_tags(case['xml'], text_tags=[])
+        extracted = parse_and_extract_text(fixed, case['tname'])
+        self.assertEqual(unescape_cdata(extracted), unescape_cdata(case['content']))
+
+    @given(xml_with_cdata_tag(close_style='cdata_close'))
+    def test_cdata_cdata_close(self, case):
+        """`</CDATA>` residue before close tag is stripped."""
+        fixed = fix_llm_xml.fix_xml_with_text_tags(case['xml'], text_tags=[])
+        extracted = parse_and_extract_text(fixed, case['tname'])
+        self.assertEqual(unescape_cdata(extracted), unescape_cdata(case['content']))
+
+    @given(xml_with_cdata_tag(close_style='plain'))
+    def test_cdata_plain_close(self, case):
+        """Plain `</name>` without any CDATA end works and outputs standard CDATA."""
+        fixed = fix_llm_xml.fix_xml_with_text_tags(case['xml'], text_tags=[])
+        extracted = parse_and_extract_text(fixed, case['tname'])
+        self.assertEqual(unescape_cdata(extracted), unescape_cdata(case['content']))
+
+    @given(
+        st_tag_name,
+        st_tag_name,
+        st.text(alphabet=st_char_no_controls, max_size=50),
+    )
+    def test_cdata_fallback_auto_close(self, root, tname, content):
+        """When no close tag is found but a foreign tag appears, the CDATA tag
+        is auto-closed at the boundary."""
+        assume(root != tname)
+        assume(']]>' not in content)
+        assume(f'</{tname}>' not in content)
+        assume(f'<{tname}' not in content)
+        assume(f'<{root}' not in content)
+        assume(f'</{root}>' not in content)
+        foreign = 'other'
+        xml = f"<{root}><{tname}><![CDATA[{content}<{foreign}></{foreign}></{root}>"
+        fixed = fix_llm_xml.fix_xml_with_text_tags(xml, text_tags=[])
+        extracted = parse_and_extract_text(fixed, tname)
+        self.assertEqual(unescape_cdata(extracted), unescape_cdata(content))
+        # foreign tag should be a sibling
+        root_elem = etree.fromstring(fixed)
+        self.assertIsNotNone(root_elem.find(foreign))
+
+    @given(
+        st_tag_name,
+        st_tag_name,
+        st.text(alphabet=st_char_no_controls, max_size=30),
+        st.text(alphabet=st_char_no_controls, min_size=1, max_size=30),
+    )
+    def test_cdata_internal_cdata_end_escaped(self, root, tname, prefix, suffix):
+        """An unescaped `]]>` inside CDATA (not immediately before `</name>`)
+        is escaped in the output."""
+        assume(root != tname)
+        assume(']]>' not in prefix + suffix)
+        assume(not suffix.startswith(f'</{tname}>'))
+        content = prefix + ']]>' + suffix
+        xml = f"<{root}><{tname}><![CDATA[{content}]]></{tname}></{root}>"
+        fixed = fix_llm_xml.fix_xml_with_text_tags(xml, text_tags=[])
+        self.assertTrue(is_parseable_by_lxml(fixed))
+        extracted = parse_and_extract_text(fixed, tname)
+        self.assertEqual(unescape_cdata(extracted), unescape_cdata(content))
+        self.assertIn(fix_llm_xml.ESCAPED_CDATA_END, fixed)
+
+    @given(
+        st_tag_name,
+        st_tag_name,
+        st.text(alphabet=st_char_no_controls, max_size=20),
+        st.text(alphabet=st_char_no_controls, max_size=20),
+    )
+    def test_cdata_already_escaped_not_double_escaped(self, root, tname, prefix, suffix):
+        """An already-escaped CDATA end (`]]]]><![CDATA[>`) is not double-escaped."""
+        assume(root != tname)
+        assume(']]>' not in prefix + suffix)
+        assume(fix_llm_xml.ESCAPED_CDATA_END not in prefix + suffix)
+        content = prefix + fix_llm_xml.ESCAPED_CDATA_END + suffix
+        xml = f"<{root}><{tname}><![CDATA[{content}]]></{tname}></{root}>"
+        fixed = fix_llm_xml.fix_xml_with_text_tags(xml, text_tags=[])
+        extracted = parse_and_extract_text(fixed, tname)
+        self.assertEqual(unescape_cdata(extracted), unescape_cdata(content))
+
+
+class TestAttributeRepair(unittest.TestCase):
+    """Invariants for attribute repair (design §5.1)."""
+
+    @given(xml_with_broken_attrs())
+    def test_attributes_standardized(self, case):
+        """Malformed attributes are repaired to well-formed ones."""
+        fixed = fix_llm_xml.fix_xml_with_text_tags(case['xml'], text_tags=[])
+        self.assertTrue(is_parseable_by_lxml(fixed),
+                        f"lxml cannot parse: {fixed!r}")
+        root_elem = etree.fromstring(fixed)
+        elem = root_elem.find(case['tname'])
+        self.assertIsNotNone(elem)
+        for name, value in case['expected_attrs'].items():
+            self.assertEqual(elem.get(name), value,
+                             f"Attribute {name} mismatch in {fixed!r}")
+
+    @given(st_tag_name, st.text(alphabet=st_char_no_controls, max_size=20).filter(lambda s: '>' not in s))
+    def test_end_tag_attrs_stripped(self, tag_name, attr_str):
+        """Attributes on end tags are removed."""
+        xml = f'<root><{tag_name}>text</{tag_name} {attr_str}></root>'
+        fixed = fix_llm_xml.fix_xml_with_text_tags(xml, text_tags=[])
+        self.assertTrue(is_parseable_by_lxml(fixed))
+        self.assertIn(f'</{tag_name}>', fixed)
+        self.assertNotIn(f'</{tag_name} ', fixed)
+
+
+class TestNativeCdata(unittest.TestCase):
+    """Invariants for native CDATA preservation in non-text structural tags."""
+
+    @given(
+        st_tag_name,
+        st_tag_name,
+        st.text(alphabet=st_char_no_controls, max_size=50).filter(lambda s: ']]>' not in s),
+    )
+    def test_native_cdata_preserved(self, root, tname, cdata_content):
+        """Well-formed native CDATA inside a structural tag is preserved as-is."""
+        assume(root != tname)
+        xml = f"<{root}><{tname}><![CDATA[{cdata_content}]]></{tname}></{root}>"
+        fixed = fix_llm_xml.fix_xml_with_text_tags(xml, text_tags=[])
+        self.assertIn(f"<![CDATA[{cdata_content}]]>", fixed)
+        self.assertTrue(is_parseable_by_lxml(fixed))
+
+    @given(
+        st_tag_name,
+        st_tag_name,
+        st.text(alphabet=st_char_no_controls, max_size=50).filter(lambda s: ']]>' not in s),
+    )
+    def test_native_cdata_missing_end(self, root, tname, cdata_content):
+        """Missing `]]>` is repaired by finding the close tag."""
+        assume(root != tname)
+        xml = f"<{root}><{tname}><![CDATA[{cdata_content}</{tname}></{root}>"
+        fixed = fix_llm_xml.fix_xml_with_text_tags(xml, text_tags=[])
+        self.assertTrue(is_parseable_by_lxml(fixed))
+        root_elem = etree.fromstring(fixed)
+        elem = root_elem.find(tname)
+        self.assertIsNotNone(elem)
+        self.assertEqual(elem.text, cdata_content)
+
+
+class TestTextTagBoundaries(unittest.TestCase):
+    """Invariants for same-name and ancestor tags inside text tags (design §6.1)."""
+
+    @given(
+        st_tag_name,
+        st_tag_name,
+        st.text(alphabet=st_char_no_controls, max_size=20),
+        st.text(alphabet=st_char_no_controls, max_size=20),
+        st.text(alphabet=st_char_no_controls, max_size=20),
+    )
+    def test_same_name_in_text_tag(self, root, tname, prefix, middle, suffix):
+        """A same-name start tag inside a text tag triggers implicit close and split."""
+        assume(root != tname)
+        assume(f'<{tname}' not in prefix + middle + suffix)
+        assume(f'</{tname}>' not in prefix + middle + suffix)
+        assume(f'<{root}' not in prefix + middle + suffix)
+        assume(f'</{root}>' not in prefix + middle + suffix)
+        assume('<' not in prefix + middle + suffix)
+        xml = f"<{root}><{tname}>{prefix}<{tname}>{middle}</{tname}>{suffix}</{root}>"
+        fixed = fix_llm_xml.fix_xml_with_text_tags(xml, text_tags=[tname])
+        root_elem = etree.fromstring(fixed)
+        children = root_elem.findall(tname)
+        self.assertEqual(len(children), 2,
+                         f"Expected 2 {tname} elements, got {len(children)} in {fixed!r}")
+        self.assertEqual(children[0].text or '', xml_unescape(prefix))
+        self.assertEqual(children[1].text or '', xml_unescape(middle))
+        self.assertEqual(children[1].tail or '', xml_unescape(suffix))
+
+    @given(
+        st_tag_name,
+        st_tag_name,
+        st.text(alphabet=st_char_no_controls, max_size=20),
+        st.text(alphabet=st_char_no_controls, max_size=20),
+    )
+    def test_ancestor_in_text_tag(self, root, tname, prefix, middle):
+        """An ancestor start tag inside a text tag triggers implicit close."""
+        assume(root != tname)
+        assume('<' not in prefix and '<' not in middle)
+        assume(f'<{tname}' not in prefix + middle)
+        assume(f'</{tname}>' not in prefix + middle)
+        assume(f'<{root}' not in prefix + middle)
+        assume(f'</{root}>' not in prefix + middle)
+
+        xml = f"<{root}><{tname}>{prefix}<{root}>{middle}</{root}></{root}>"
+        fixed = fix_llm_xml.fix_xml_with_text_tags(xml, text_tags=[tname])
+
+        root_elem = etree.fromstring(fixed)
+
+        t_elem = root_elem.find(tname)
+        self.assertIsNotNone(t_elem, f"No {tname} found in {fixed!r}")
+        self.assertEqual(t_elem.text or '', xml_unescape(prefix))
+
+        inner_root = root_elem.find(root)
+        self.assertIsNotNone(inner_root, f"No inner {root} found in {fixed!r}")
+        self.assertEqual(inner_root.text or '', xml_unescape(middle))
 
 
 class TestEscapeCdataEnds(unittest.TestCase):
